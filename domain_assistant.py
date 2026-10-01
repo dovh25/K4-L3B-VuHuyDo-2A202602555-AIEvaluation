@@ -266,6 +266,102 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Generator implementation for Google Gemini API."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        import urllib.error
+        import urllib.request
+
+        self.api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("GOOGLE_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self.model = (
+            os.getenv("GEMINI_MODEL", "").strip()
+            or (
+                os.getenv("OPENAI_MODEL", "").strip()
+                if "gemini" in os.getenv("OPENAI_MODEL", "").lower()
+                else ""
+            )
+            or "gemini-1.5-flash"
+        )
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) is missing from .env")
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        import urllib.error
+        import urllib.request
+
+        model_name = self.model.removeprefix("models/")
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={self.api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        import time
+
+        max_retries = 6
+        resp_data = None
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    break
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="replace")
+                if e.code in (429, 503) and attempt < max_retries - 1:
+                    sleep_time = (attempt + 1) * 3
+                    print(f"Gemini API returned {e.code}, retrying in {sleep_time}s...", flush=True)
+                    time.sleep(sleep_time)
+                    continue
+                raise RuntimeError(f"Gemini API HTTP {e.code}: {err_body}") from e
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    sleep_time = (attempt + 1) * 3
+                    print(f"Gemini API network error, retrying in {sleep_time}s...", flush=True)
+                    time.sleep(sleep_time)
+                    continue
+                raise RuntimeError(f"Gemini API request failed: {e}") from e
+
+        try:
+            candidates = resp_data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError(f"Gemini returned no candidates: {resp_data}")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer = "".join(part.get("text", "") for part in parts).strip()
+            if not answer:
+                raise RuntimeError("Gemini returned an empty answer")
+            return answer
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse Gemini response: {e}") from e
+
+
+def create_default_generator(max_output_tokens: int = 300) -> TextGenerator:
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openai_model = os.getenv("OPENAI_MODEL", "").strip().lower()
+
+    if gemini_key or "gemini" in openai_model or openai_key.startswith("AIza"):
+        return GeminiGenerator(max_output_tokens=max_output_tokens)
+    return OpenAIGenerator(max_output_tokens=max_output_tokens)
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +395,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else create_default_generator(),
             top_k,
         )
 
@@ -451,6 +547,7 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(1.0)
 
     return {
         "schema_version": "1.0",
